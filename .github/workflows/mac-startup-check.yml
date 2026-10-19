@@ -1,0 +1,57 @@
+name: Mac exact download startup reliability
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  startup:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Download and verify notarised Mac release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.9.18 --repo "$GITHUB_REPOSITORY" --pattern App-Breaker-0.9.18-Mac-arm64-notarised.zip
+          echo '487c929b75997781ce3cb22ff87898703b3baa663ca3b602596c8bd217766677  App-Breaker-0.9.18-Mac-arm64-notarised.zip' | shasum -a 256 -c
+          ditto -x -k App-Breaker-0.9.18-Mac-arm64-notarised.zip extracted
+          codesign --verify --deep --strict 'extracted/App Breaker.app'
+          xcrun stapler validate 'extracted/App Breaker.app'
+          spctl --assess --type execute 'extracted/App Breaker.app'
+      - name: Repeat startup with strict deadline and clean data directories
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, platform, socket, subprocess, time, urllib.request
+          assert platform.machine() == 'arm64'
+          binary=pathlib.Path('extracted/App Breaker.app/Contents/MacOS/App Breaker').resolve()
+          results=[]
+          for attempt in range(10):
+              with socket.socket() as s:
+                  s.bind(('127.0.0.1',0));port=s.getsockname()[1]
+              data=pathlib.Path(f'acceptance/start-{attempt}').resolve();data.mkdir(parents=True)
+              env={**os.environ,'APP_BREAKER_NO_BROWSER':'1','APP_BREAKER_PORT':str(port),'APP_BREAKER_DATA_DIR':str(data),'PATH':'/usr/bin:/bin'}
+              for key in ('PYTHONPATH','PYTHONHOME','NODE_PATH','NODE_OPTIONS','PLAYWRIGHT_BROWSERS_PATH'):env.pop(key,None)
+              with (data/'process.log').open('w') as log:
+                  start=time.monotonic();p=subprocess.Popen([str(binary)],env=env,stdout=log,stderr=log)
+                  ready=False
+                  try:
+                      while time.monotonic()-start<25:
+                          if p.poll() is not None:raise AssertionError('Exited before startup')
+                          try:
+                              with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/status',timeout=2) as response:
+                                  assert json.load(response)['version']=='0.9.18-alpha';ready=True;break
+                          except OSError:time.sleep(.1)
+                      if not ready:
+                          subprocess.run(['/usr/bin/sample',str(p.pid),'1','1','-file',str(data/'sample.txt')],timeout=10)
+                          sample=data/'sample.txt'
+                          if sample.exists():print(sample.read_text()[:24000])
+                          raise AssertionError('Startup exceeded unchanged 25-second deadline')
+                      results.append(round(time.monotonic()-start,3))
+                  finally:
+                      p.terminate()
+                      try:p.wait(timeout=10)
+                      except subprocess.TimeoutExpired:p.kill();p.wait()
+              print('startup',attempt,results[-1])
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
+              out.write('Exact notarised 0.9.18 startup times (seconds): '+json.dumps(results)+'\nStartup only, not paid execution acceptance.\n')
+          PY
