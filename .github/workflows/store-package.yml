@@ -1,0 +1,80 @@
+name: Store package validation
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download exact verified binary
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release download v0.9.18 --repo $env:GITHUB_REPOSITORY --pattern App-Breaker-Windows-candidate.zip
+          if ($LASTEXITCODE) { throw 'Download failed' }
+          if ((Get-FileHash App-Breaker-Windows-candidate.zip -Algorithm SHA256).Hash.ToLower() -ne '655b44471ef4683c2d5057650e1a7b6ae4176fa9ddd42f988fafeb28c4801ac9') { throw 'Checksum mismatch' }
+          Expand-Archive App-Breaker-Windows-candidate.zip candidate
+          New-Item -ItemType Directory layout/Assets | Out-Null
+          Move-Item 'candidate/App Breaker' layout/App
+      - name: Create Store assets and exact identity manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.Drawing
+          foreach ($entry in @(@('StoreLogo.png',50),@('Square44x44Logo.png',44),@('Square150x150Logo.png',150))) {
+            $size = [int]$entry[1]
+            $image = [System.Drawing.Bitmap]::new($size,$size)
+            $canvas = [System.Drawing.Graphics]::FromImage($image)
+            $canvas.Clear([System.Drawing.ColorTranslator]::FromHtml('#101211'))
+            $canvas.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+            $font = [System.Drawing.Font]::new('Consolas',($size*0.46),[System.Drawing.FontStyle]::Bold,[System.Drawing.GraphicsUnit]::Pixel)
+            $brush = [System.Drawing.SolidBrush]::new([System.Drawing.ColorTranslator]::FromHtml('#c8fa6d'))
+            $format = [System.Drawing.StringFormat]::new()
+            $format.Alignment = [System.Drawing.StringAlignment]::Center
+            $format.LineAlignment = [System.Drawing.StringAlignment]::Center
+            $canvas.DrawString('AB',$font,$brush,[System.Drawing.RectangleF]::new(0,0,$size,$size),$format)
+            $image.Save((Join-Path "$pwd/layout/Assets" $entry[0]),[System.Drawing.Imaging.ImageFormat]::Png)
+            $format.Dispose(); $brush.Dispose(); $font.Dispose(); $canvas.Dispose(); $image.Dispose()
+          }
+          @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">
+            <Identity Name="JKGlobalEnterprises.AppBreaker" Publisher="CN=B6B6E58B-AC78-4E9A-AC26-E0C3DC5F1689" Version="0.9.18.0" ProcessorArchitecture="x64"/>
+            <Properties><DisplayName>App Breaker</DisplayName><PublisherDisplayName>JK Global Enterprises</PublisherDisplayName><Description>Authorised local software testing and evidence reports.</Description><Logo>Assets\StoreLogo.png</Logo></Properties>
+            <Resources><Resource Language="en-us"/></Resources>
+            <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0"/></Dependencies>
+            <Applications><Application Id="AppBreaker" Executable="App\App Breaker.exe" EntryPoint="Windows.FullTrustApplication"><uap:VisualElements DisplayName="App Breaker" Description="Authorised local software testing and evidence reports." Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" BackgroundColor="transparent"/></Application></Applications>
+            <Capabilities><rescap:Capability Name="runFullTrust"/></Capabilities>
+          </Package>
+          '@ | Set-Content layout/AppxManifest.xml -Encoding utf8
+          $os = [System.Environment]::OSVersion.Version.ToString()
+          [xml]$manifest = Get-Content layout/AppxManifest.xml
+          $manifest.Package.Dependencies.TargetDeviceFamily.MaxVersionTested = $os
+          $manifest.Save("$pwd/layout/AppxManifest.xml")
+          "Build host: $os" >> $env:GITHUB_STEP_SUMMARY
+      - name: Validate and package using Windows SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdk = Get-ChildItem '${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/makeappx.exe' | Sort-Object FullName -Descending | Select-Object -First 1
+          if (!$sdk) { $sdk = Get-ChildItem 'C:/Program Files (x86)/Windows Kits/10/bin/*/x64/makeappx.exe' | Sort-Object FullName -Descending | Select-Object -First 1 }
+          if (!$sdk) { throw 'Windows SDK missing' }
+          & $sdk.FullName pack /d layout /p App-Breaker-0.9.18-x64.msix /o
+          if ($LASTEXITCODE) { throw 'Package validation failed' }
+          & $sdk.FullName unpack /p App-Breaker-0.9.18-x64.msix /d unpacked /o
+          if ($LASTEXITCODE) { throw 'Package unpack verification failed' }
+          if ((Get-FileHash 'layout/App/App Breaker.exe').Hash -ne (Get-FileHash 'unpacked/App/App Breaker.exe').Hash) { throw 'Executable changed' }
+          $hash = (Get-FileHash App-Breaker-0.9.18-x64.msix -Algorithm SHA256).Hash.ToLower()
+          "$hash  App-Breaker-0.9.18-x64.msix" | Set-Content MSIX-SHA256SUMS.txt
+          "SDK pack validation and unpacked executable integrity passed. Installation and Store certification remain separate gates." >> $env:GITHUB_STEP_SUMMARY
+      - name: Keep validated package in draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload v0.9.18 --repo $env:GITHUB_REPOSITORY App-Breaker-0.9.18-x64.msix MSIX-SHA256SUMS.txt --clobber
+          if ($LASTEXITCODE) { throw 'Draft upload failed' }
