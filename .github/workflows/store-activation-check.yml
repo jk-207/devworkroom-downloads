@@ -2,7 +2,8 @@ name: Store package activation check
 on:
   workflow_dispatch:
 permissions:
-  contents: read
+  # GitHub requires write scope to read an unpublished draft release.
+  contents: write
 jobs:
   registration:
     runs-on: windows-latest
