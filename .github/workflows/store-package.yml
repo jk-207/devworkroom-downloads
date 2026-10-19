@@ -60,8 +60,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $sdk = Get-ChildItem '${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/makeappx.exe' | Sort-Object FullName -Descending | Select-Object -First 1
-          if (!$sdk) { $sdk = Get-ChildItem 'C:/Program Files (x86)/Windows Kits/10/bin/*/x64/makeappx.exe' | Sort-Object FullName -Descending | Select-Object -First 1 }
+          $sdk = Get-ChildItem 'C:/Program Files (x86)/Windows Kits/10/bin/*/x64/makeappx.exe' | Sort-Object FullName -Descending | Select-Object -First 1
           if (!$sdk) { throw 'Windows SDK missing' }
           & $sdk.FullName pack /d layout /p App-Breaker-0.9.18-x64.msix /o
           if ($LASTEXITCODE) { throw 'Package validation failed' }
