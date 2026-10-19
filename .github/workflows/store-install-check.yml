@@ -1,0 +1,61 @@
+name: Store development registration check
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  registration:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch validated Store candidate
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          gh release download v0.9.18 --repo $env:GITHUB_REPOSITORY --pattern App-Breaker-0.9.18-x64.msix
+          if ($LASTEXITCODE) { throw 'Download failed' }
+          if ((Get-FileHash App-Breaker-0.9.18-x64.msix -Algorithm SHA256).Hash.ToLower() -ne '360a5b6cb69d788cce709d190260682e893f1f5835e28e5a6c3ac39470300772') { throw 'Hash mismatch' }
+          $sdk=Get-ChildItem 'C:/Program Files (x86)/Windows Kits/10/bin/*/x64/makeappx.exe' | Sort-Object FullName -Descending | Select-Object -First 1
+          & $sdk.FullName unpack /p App-Breaker-0.9.18-x64.msix /d layout /o
+          if ($LASTEXITCODE) { throw 'Unpack failed' }
+      - name: Register development package and check local startup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          # Only this disposable CI host enables development package registration.
+          New-Item 'HKLM:/SOFTWARE/Microsoft/Windows/CurrentVersion/AppModelUnlock' -Force | Out-Null
+          New-ItemProperty 'HKLM:/SOFTWARE/Microsoft/Windows/CurrentVersion/AppModelUnlock' -Name AllowDevelopmentWithoutDevLicense -Value 1 -PropertyType DWord -Force | Out-Null
+          Add-AppxPackage -Register "$pwd/layout/AppxManifest.xml"
+          $package=Get-AppxPackage -Name JKGlobalEnterprises.AppBreaker
+          if (!$package -or $package.PackageFamilyName -ne 'JKGlobalEnterprises.AppBreaker_bfvrexrdfcy5p') { throw 'Registration identity mismatch' }
+          $env:APP_BREAKER_PORT='61357'
+          $env:APP_BREAKER_NO_BROWSER='1'
+          $env:APP_BREAKER_DATA_DIR="$env:RUNNER_TEMP/ab-store-acceptance"
+          $env:APP_BREAKER_REQUIRE_BUNDLE='0'
+          $process=$null
+          try {
+            $process=Start-Process "$pwd/layout/App/App Breaker.exe" -PassThru -RedirectStandardOutput startup.log -RedirectStandardError startup-error.log
+            $deadline=(Get-Date).AddSeconds(25)
+            $ready=$false
+            while ((Get-Date) -lt $deadline) {
+              try { $status=Invoke-RestMethod http://127.0.0.1:61357/api/status -TimeoutSec 2; $ready=$true; break } catch { Start-Sleep -Milliseconds 200 }
+            }
+            if (!$ready) { throw 'Packaged startup timed out' }
+            if ($status.version -ne '0.9.18-alpha') { throw 'Version mismatch' }
+            foreach ($mode in @('mock','web','adb','ios','macos','windows')) {
+              $body=@{mode=$mode;authorised=$true;duration_minutes=1;client_request_id=[guid]::NewGuid().ToString()} | ConvertTo-Json
+              $response=Invoke-WebRequest http://127.0.0.1:61357/api/sessions -Method Post -ContentType application/json -Body $body -SkipHttpErrorCheck
+              if ([int]$response.StatusCode -ne 401) { throw "Anonymous $mode execution not denied" }
+            }
+            'Development registration, packaged executable startup and anonymous denial passed. This is not Store-signed installation, package-identity activation or paid execution acceptance.' >> $env:GITHUB_STEP_SUMMARY
+          } finally {
+            if ($process -and !$process.HasExited) { Stop-Process -Id $process.Id -Force }
+            Remove-AppxPackage -Package $package.PackageFullName
+            if (Get-AppxPackage -Name JKGlobalEnterprises.AppBreaker) { throw 'Unregistration failed' }
+          }
+      - name: Diagnostic output on failure
+        if: failure()
+        shell: pwsh
+        run: Get-Content startup*.log -ErrorAction SilentlyContinue
